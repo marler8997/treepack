@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+import sys
+import os
+import shutil
+
+script_dir = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, os.path.join(script_dir, "pylibs"))
+
+import util
+
+def usage():
+    print("""Usage: treepack [-r|--repo <repo>] <command> <args>...
+
+Commands:
+  add                Add a package
+  list               Print directories for a list of packages""")
+
+def get_command_index():
+    index = 1
+    while True:
+        if index >= len(sys.argv):
+            usage();
+            sys.exit(1)
+        arg = sys.argv[index]
+
+        if not arg.startswith("-"):
+            return index
+        if arg == "-h" or arg == "--help" or arg == "-v" or arg == "--verbose":
+            pass
+        elif arg == "-r" or arg == "--repo":
+            index, arg = util.get_opt_arg(index)
+        else:
+            sys.exit("Error: unknown option '%s'" % arg)
+        index += 1
+
+
+command_index = get_command_index()
+command = sys.argv[command_index]
+program_name = "treepack-" + command
+
+program = os.path.join(script_dir, program_name)
+if not os.path.exists(program):
+    program = shutil.which(program_name)
+    if program == None:
+        sys.exit("Error: '%s' is not a treepack command" % command)
+
+os.execv(program, [program] + sys.argv[1:command_index] + sys.argv[command_index + 1:])
+sys.exit("Error: failed to exec '%s'" % program)

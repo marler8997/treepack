@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+import os
+import sys
+import filecmp
+import stat
+import enum
+
+script_dir = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(script_dir, "pylibs"))
+
+import util
+import loggy
+import treepack
+
+# TODO: add an option that will cause it to fail if the repository does not exist yet
+#       --no-create?
+# TODO: add option to include/exclude paths in the package-dir
+
+def usage():
+    print("""Usage: treepack add <package-dir> [<repo-dir>]
+
+Add a package to a treepack repository
+
+Options:
+  --name <name>        Provide the package name instead of using the directory name
+  --exclude <path>     Provide a path to exclude, multiple options are supported
+  --verbose|-v         Print verbose information
+  --help|-h            Print this usage""")
+
+repo_dir = "."
+package_name = None
+excludes = []
+
+cmd_args = []
+argv_index = 1
+while argv_index < len(sys.argv):
+    arg = sys.argv[argv_index]
+    if not arg.startswith("-"):
+        cmd_args.append(arg)
+    elif arg == "--name":
+        argv_index, package_name = util.get_opt_arg(argv_index)
+    elif arg == "--exclude":
+        argv_index, new_exclude = util.get_opt_arg(argv_index)
+        excludes.append(new_exclude)
+    elif arg == "--verbose" or arg == "-v":
+        loggy.enable = True
+    elif arg == "--help" or arg == "-h":
+        usage()
+        exit(1)
+    else:
+        sys.exit("Error: unknown option '%s'" % arg)
+    argv_index += 1
+
+util.check_arg_count(usage, cmd_args, min=1, max=2)
+
+package_srcdir = cmd_args[0]
+
+if package_name == None:
+    package_name = os.path.basename(os.path.abspath(package_srcdir))
+#print("[DEBUG] package name '%s'" % package_name)
+
+if len(cmd_args) >= 2:
+    repo_dir = cmd_args[1]
+    if not os.path.exists(repo_dir):
+        print("Creating new treepack repository at '%s'" % repo_dir)
+        loggy.mkdir(repo_dir)
+        # create empty treepack file
+        filename = os.path.join(repo_dir, treepack.CONFIG_BASENAME)
+        with open(filename, "w") as file:
+            os.utime(filename, None)
+    else:
+        treepack.enforce_is_treepack_repo(repo_dir)
+        print("Treepack repository '%s' already exists" % repo_dir)
+else:
+    repo_dir = treepack.get_treepack_root()
+    if repo_dir == None:
+        sys.exit("Error: not inside a treepack repo, add the repo as an argument or cd into it")
+
+#print("[DEBUG] repo_dir = '%s'" % repo_dir)
+packs_dir = os.path.join(repo_dir, "packs")
+package_dstdir = os.path.join(packs_dir, package_name)
+
+if os.path.exists(package_dstdir):
+    sys.exit("Error: package '%s' already exists" % package_name);
+
+file_set_map = {}
+
+def find_in_any_pack(relname, srcname, link_target):
+    if os.path.exists(packs_dir):
+        for package in os.listdir(packs_dir):
+            package_file = os.path.join(packs_dir, package, relname)
+            file_stat = util.lstat_nothrow(package_file)
+            if file_stat == None:
+                continue
+            mode = file_stat.st_mode
+            if link_target == None:
+                if stat.S_ISREG(mode):
+                    if filecmp.cmp(srcname, package_file, False):
+                        #print("[DEBUG] file '%s' already in package '%s'" % (relname, package))
+                        return package, package_file
+                sys.exit("CONFLICT: file '%s' with package '%s'" % (relname, package))
+            else:
+                if stat.S_ISLNK(mode):
+                    existing_link_target = os.readlink(package_file)
+                    if link_target == existing_link_target:
+                        return package, package_file
+                    sys.exit("CONFLICT: link '%s -> %s' conflicts with package '%s' link to '%s'" % (
+                        relname, link_target, package, existing_link_target))
+                sys.exit("CONFLICT: link '%s' with package '%s'" % (relname, package))
+    return None, None
+
+def load_dir(relname, srcdir):
+    global file_set_map, excludes
+    #print("[DEBUG] --- dir '%s'" % relname)
+
+    # todo: excludes could be handled more efficiently
+    for exclude in excludes:
+        if relname.startswith(exclude):
+            print("directory '%s' has been excluded" % relname)
+            return
+
+    for entry_base in os.listdir(srcdir):
+        relentry = os.path.join(relname, entry_base)
+        srcentry = os.path.join(srcdir, entry_base)
+        entry_mode = os.lstat(srcentry).st_mode
+        if stat.S_ISDIR(entry_mode):
+            load_dir(relentry, srcentry)
+        else:
+            if stat.S_ISLNK(entry_mode):
+                link_target = os.readlink(srcentry)
+            else:
+                link_target = None
+            #print("[DEBUG] file '%s'" % relentry)
+            existing_package, existing_file = find_in_any_pack(relentry, srcentry, link_target)
+            util.set_append(file_set_map, existing_package, (relentry, link_target))
+
+nextop_filename = os.path.join(repo_dir, "next_operation")
+
+# TAKE A MODIFY LOCK!
+
+# check if there is already an operation in progress or that was cancelled
+if os.path.exists(nextop_filename):
+    sys.exit("Error: there is already an operation in progress! ('%s' exists)" % nextop_filename)
+
+deps = treepack.parse_package_deps(repo_dir)
+load_dir("", package_srcdir)
+
+def get_new_package_relation_to(existing_package):
+    global file_set_map
+
+    # 3 cases E = "existing package", N = "new package"
+    #         E0 = "set of files owned by E"
+    #         N0 = "set of files owned by N"
+    # Case 1: N is a superset of E (all files in E are also in N)  OR "for all f in E, f is in N"
+    #    - set N to depend on E
+    # Case 2: E is a superset of N (all files in N are also in E) OR "for all f in N, f is in E"
+    #    - set E to depend on N
+    #    - move ownership of shared files between E0 and N from E0 to N0
+    # case 3: there is at least 1 non-shared file between E and N
+    #    - move ownership of shared files betweeen E0 and N to a new package
+    #    - set E and N to depend on this new package
+
+    relation = None
+    for pn in file_set_map.keys():
+        if pn == existing_package:
+            continue
+        if pn == None:
+            # only works if N is a superset of E
+            next_relation = treepack.LEFT_SUPERSET_OF_RIGHT
+            print("[DEBUG] RELATION: '%s' to new package must be %s" % (existing_package_name, next_relation))
+        else:
+            next_relation = deps.get_package_relation(pn, existing_package_name)
+            print("[DEBUG] RELATION: '%s' to '%s' is %s" % (pn, existing_package_name, next_relation))
+
+        if next_relation == treepack.LEFT_SUPERSET_OF_RIGHT:
+            if relation == None:
+                relation = treepack.LEFT_SUPERSET_OF_RIGHT
+            elif relation != treepack.LEFT_SUPERSET_OF_RIGHT:
+                return None
+        elif next_relation == treepack.RIGHT_SUPERSET_OF_LEFT:
+            if relation == None:
+                relation = treepack.RIGHT_SUPERSET_OF_LEFT
+            elif relation != treepack.RIGHT_SUPERSET_OF_LEFT:
+                return None
+        else:
+            return None
+
+    # in this case, we need to
+    if relation == None:
+        # this means that existing_package is the one and only package
+        # and that the new package has no unique files
+        # this means that the existing package MUST BE a superset of the
+        # new package
+        return RIGHT_SUPERSET_OF_LEFT
+    #if relation == treepack.LEFT_SUPERSET_OF_RIGHT:
+        # need to verify that all packages
+    sys.exit("TODO: verify relation '%s'" % relation)
+    return relation
+
+#print("[DEBUG] file_set_map = %s" % file_set_map)
+
+processed = {}
+
+#def process_package_no_check(package
+
+class Relation(enum.Enum):
+    NO_SHARED_FILES = 0
+    IS_SUBSET = 1
+    IS_SUPERSET = 2
+    NEED_NEW_SET = 3
+
+
+
+def _find_file_not_in(files, fulldir, reldir):
+    for entry_base in os.listdir(fulldir):
+        entry_fullname = os.path.join(fulldir, entry_base)
+        entry_relname  = os.path.join(reldir, entry_base)
+        #print("[DEBUG] check '%s'" % entry_relname)
+        if os.path.isdir(entry_fullname):
+            result = _find_file_not_in(files, entry_fullname, entry_relname)
+            if result:
+                return result;
+        else:
+            if not entry_relname in files:
+                return entry_relname
+    return None
+def find_file_not_in(files, dir):
+    #print("[DEBUG] find_file_not_in: dir='%s' files=%s" % (dir, files))
+    return _find_file_not_in(files, dir, "")
+
+# the new package one relation with every package
+# call the new package N and an existing package E
+# 1. E has no shared files with N
+#    - this is the simplest case, E does not change
+# 2. E is a subset of N
+#    - The is the second simplest case, in this case you make
+#      E a dependency of N
+# 3. E is a superset of N
+#    - Make N a dependency of E, and move shared files from E0 to N0
+# 4. E and N share at least one file, and do not share at least 1 file
+#    - Make new package P, make P a dependency of E and N, move shared files from E0 to P0
+def process_package(package, shared_files):
+    if package in processed:
+        return processed[package]
+    processed[package] = True
+
+    relation = Relation.NO_SHARED_FILES
+    this_package_deps = deps.get_deps(package)
+    for dep_package in this_package_deps:
+        result = process_package(dep_package, file_set_map.get(dep_package))
+        if result == Relation.NO_SHARED_FILES:
+            if relation == Relation.NO_SHARED_FILES:
+                pass
+            else:
+                sys.exit("not impl A")
+        elif result == Relation.IS_SUBSET:
+            sys.exit("not impl B")
+        elif result == Relation.IS_SUPERSET:
+            sys.exit("not impl C")
+        else:
+            assert result == Relation.NEED_NEW_SET
+            sys.exit("not impl D")
+
+    if shared_files == None:
+        if relation == Relation.NO_SHARED_FILES:
+            return relation
+        else:
+            sys.exit("not impl E")
+
+    if relation == Relation.NO_SHARED_FILES:
+        if len(this_package_deps) == 0:
+            dir = treepack.get_package_dir(repo_dir, package)
+            file = find_file_not_in(shared_files, dir)
+            if file == None:
+                print("[DEBUG] '%s' is subset" % package)
+                return Relation.IS_SUBSET
+            print("[DEBUG] '%s' is not subset (has extra file '%s')" % (package, file))
+        else:
+            print("[DEBUG] '%s' is not subset (has deps that aren't shared)" % package)
+
+        # at this point we've elimited case 1 (we have shared files)
+        # and case 2 (we are not a subset)
+        # are we a superset?
+        file_set_count = len(file_set_map)
+        if file_set_count == 1:
+            # we must be a superset I think
+            print("[DEBUG] '%s' is a superset (there is only 1 set of shared files)" % package)
+            return Relation.IS_SUPERSET
+        print("[DEBUG] '%s' needs a new set (file_set_count = %d)" % (package, file_set_count))
+        return Relation.NEED_NEW_SET
+    else:
+        sys.exit("not impl F.2")
+    # check dependencies
+    #relation = get_new_package_relation_to(existing_package_name)
+    #print("[DEBUG] relation = %s" % relation)
+    #if relation == None:
+    #    sys.exit("TODO: implement case 3")
+    #elif relation == treepack.LEFT_SUPERSET_OF_RIGHT:
+    #    sys.exit("TODO: implement case 1 (N '%s' is superset of E '%s')" % (package_name, existing_package_name))
+    #else:
+    #    sys.exit("TODO: implement case 2")
+
+with open(nextop_filename, "w") as opfile:
+    opfile.write("newpackage %s\n" % package_name)
+    opfile.write("source %s\n" % package_srcdir)
+    #print("New package contains %s files:" % len(files))
+    for existing_package_name, file_set in file_set_map.items():
+        #print("package '%s'" % existing_package_name)
+        if existing_package_name == None:
+            opfile.write("package %s\n" % package_name)
+            for file, link_target in file_set:
+                if link_target == None:
+                    opfile.write(" %s\n" % file)
+                else:
+                    opfile.write(" %s -> %s\n" % (file, link_target))
+        else:
+            result = process_package(existing_package_name, file_set)
+            if result == Relation.NEED_NEW_SET:
+                opfile.write("split %s\n" % existing_package_name)
+                for file, link_target in file_set:
+                    opfile.write(" %s\n" % file)
+            elif result == Relation.IS_SUPERSET:
+                opfile.write("superset %s\n" % existing_package_name)
+                for file, link_target in file_set:
+                    opfile.write(" %s\n" % file)
+            else:
+                sys.exit("not impl: process package result for '%s' is %s" % (existing_package_name, result))
+
+treepack.execute_next_op(repo_dir, deps)

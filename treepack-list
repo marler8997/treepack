@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+script_dir = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(script_dir, "pylibs"))
+
+import util
+import treepack
+
+# TODO: add options to control whether the paths can be absolute/relative
+def usage():
+    print("""Usage: treepack list <packages>...
+
+Print the list of directories that contain all files for the given packages
+
+Options:
+  --rex                Print in the rex format
+  --repo|-r <repo-dir> Use the given treepack repo instead of the current directory
+  --help|-h            Print this usage""")
+
+repo_dir = None
+rex_format = False
+
+cmd_args = []
+argv_index = 1
+while argv_index < len(sys.argv):
+    arg = sys.argv[argv_index]
+    if not arg.startswith("-"):
+        cmd_args.append(arg)
+    elif arg == "--repo" or arg == "-r":
+        argv_index, repo_dir = util.get_opt_arg(argv_index)
+    elif arg == "--rex":
+        rex_format = True
+    elif arg == "--help" or arg == "-h":
+        usage()
+        exit(1)
+    else:
+        sys.exit("Error: unknown option '%s'" % arg)
+    argv_index += 1
+
+util.check_arg_count(usage, cmd_args, min=1)
+
+if repo_dir == None:
+    repo_dir = treepack.get_treepack_root()
+    if repo_dir == None:
+        sys.exit("Error: not inside a treepack repo, add the repo as an argument or cd into it")
+else:
+    treepack.enforce_is_treepack_repo(repo_dir)
+
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# TODO: make sure there is no operation in progress in the repo
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+deps = treepack.parse_package_deps(repo_dir)
+packs_dir = os.path.join(repo_dir, "packs")
+included_packages = {}
+
+def add_package(package):
+    global deps, included_packages
+    if not package in included_packages:
+        included_packages[package] = True
+        for dep in deps.get_deps(package):
+            add_package(dep)
+
+for package in cmd_args:
+    package_dir = os.path.join(packs_dir, package)
+    if not os.path.exists(package_dir):
+        sys.exit("Error: package '%s' does not exist" % package)
+    add_package(package)
+
+dirs = ""
+for package in included_packages:
+    if len(dirs) > 0:
+        if rex_format:
+            dirs += " "
+        else:
+            dirs += ","
+    dirs += os.path.join(packs_dir, package)
+    if rex_format:
+        dirs += ":"
+    # TODO: we could verify the package exists
+        
+sys.stdout.write(dirs)
+sys.stdout.write("\n")
